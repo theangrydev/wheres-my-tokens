@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wheres-my-tokens"
+version = "0.1.0"
+description = "Find out what's eating your Claude Code session limits"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+keywords = ["claude", "claude-code", "tokens", "usage", "limits"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Quality Assurance",
+]
+dependencies = [
+    "matplotlib>=3.8",
+    "pyyaml>=6.0",
+    "scikit-learn>=1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/theangrydev/wheres-my-tokens"
+
+[project.scripts]
+wheres-my-tokens = "wheres_my_tokens.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["wheres_my_tokens*"]
+
+[tool.setuptools.package-data]
+wheres_my_tokens = ["../config.yaml"]
