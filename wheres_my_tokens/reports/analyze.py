@@ -214,7 +214,6 @@ def run(ctx):
     print("  Investigating the unknown limit model with data science techniques.\n")
 
     # Get rate limit events and calibration points
-    # Get rate limit events and calibration points
     limit_events = _find_rate_limit_events(profiles)
     sorted_turns = sorted(turns, key=lambda t: t.timestamp)
     points = _calculate_window_costs(limit_events, sorted_turns, config)
@@ -389,7 +388,7 @@ def _budget_timeline(points, sorted_turns, config, output_dir):
 
         fig, ax = plt.subplots(figsize=(14, 6))
 
-        profiles_in_data = sorted(set(p["event"]["profile"] for p in deduped))
+        profiles_in_data = sorted(set(p["event"]["profile"] for p in points))
 
         # Sample non-hit 5h windows as baseline (per-profile internally)
         non_hit_times = []
@@ -434,8 +433,8 @@ def _budget_timeline(points, sorted_turns, config, output_dir):
                    zorder=3)
 
         # Trim x-axis to data range
-        min_date = min(p["window_end"] for p in deduped)
-        max_date = max(p["window_end"] for p in deduped)
+        min_date = min(p["window_end"] for p in points)
+        max_date = max(p["window_end"] for p in points)
         pad = (max_date - min_date) * 0.03
         ax.set_xlim(min_date - pad, max_date + pad)
 

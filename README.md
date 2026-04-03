@@ -82,6 +82,9 @@ Generate shareable PNG charts displaying your usage data.
 ### `analyze` — Advanced
 Reverse-engineer the limit formula using your actual rate-limit events. Generates budget timelines, scatter plots, and logistic regression charts.
 
+#### Budget at each rate-limit hit over time
+![Budget Timeline](img/budget_timeline.png)
+
 #### Feature correlations with limit hits
 ![Calibration Scatter](img/calibration_scatter.png)
 
