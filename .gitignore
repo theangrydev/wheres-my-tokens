@@ -8,3 +8,4 @@ build/
 output/
 scripts/
 .idea/
+.DS_Store
