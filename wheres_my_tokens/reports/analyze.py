@@ -9,6 +9,7 @@ Data science approach to reverse-engineering Anthropic's limit formula:
 
 import json
 import re
+from bisect import bisect_left, bisect_right
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -17,6 +18,62 @@ from ..formatting import (
     format_cost, format_number, format_tokens,
     section_header, subsection_header, table,
 )
+
+
+_MONTHS = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun",
+     "jul", "aug", "sep", "oct", "nov", "dec"], start=1)}
+
+# "resets 4pm (UTC)" / "resets Apr 7, 4pm" / "resets Aug 3 at 9pm (Europe/London)"
+_RESET_RE = re.compile(
+    r"resets\s+"
+    r"(?:(?P<mon>jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+"
+    r"(?P<day>\d{1,2})\s*(?:,|\s+at)?\s*)?"
+    r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>am|pm)",
+    re.IGNORECASE,
+)
+
+
+def _reset_delta_hours(text, event_ts):
+    """Hours from the event to the reset time quoted in its message text.
+
+    Returns None if no reset time is present. The timezone label in the text
+    ("(UTC)" / "(Europe/London)") is deliberately NOT resolved: callers use this
+    only to separate a same-day reset from one days away, so an hour of DST slop
+    cannot change the answer, and resolving it would add a tzdata dependency for
+    no gain.
+    """
+    m = _RESET_RE.search(text or "")
+    if not m:
+        return None
+    hour = int(m.group("hour")) % 12
+    if m.group("ampm").lower() == "pm":
+        hour += 12
+    minute = int(m.group("minute") or 0)
+
+    if m.group("mon"):
+        month = _MONTHS[m.group("mon").lower()]
+        day = int(m.group("day"))
+        year = event_ts.year
+        # A reset quoted in December against a January event is last year's
+        # wording wrapping the year boundary, not a reset 11 months out.
+        if month - event_ts.month > 6:
+            year -= 1
+        elif event_ts.month - month > 6:
+            year += 1
+        try:
+            reset = event_ts.replace(year=year, month=month, day=day,
+                                     hour=hour, minute=minute,
+                                     second=0, microsecond=0)
+        except ValueError:
+            return None
+    else:
+        # A bare clock time is the next occurrence of that time.
+        reset = event_ts.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if reset < event_ts:
+            reset += timedelta(days=1)
+
+    return (reset - event_ts).total_seconds() / 3600.0
 
 
 def _find_rate_limit_events(profiles):
@@ -48,7 +105,13 @@ def _find_rate_limit_events(profiles):
 
                         # error field is at OUTER message level, not inside message
                         error = msg.get("error", "")
-                        if error == "rate_limit":
+                        # `invalid_request` is a limit hit in disguise: when the
+                        # limit lands on a full context window, auto-compaction
+                        # cannot run (it needs an API call of its own), so the
+                        # turn dies as "Prompt is too long" with the real cause
+                        # quoted inside it. Keying on error == "rate_limit"
+                        # alone drops the entire class.
+                        if error in ("rate_limit", "invalid_request"):
                             ts_str = msg.get("timestamp", "")
                             try:
                                 ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
@@ -63,6 +126,12 @@ def _find_rate_limit_events(profiles):
                                 for c in content:
                                     if isinstance(c, dict) and c.get("type") == "text":
                                         text = c.get("text", "")
+
+                            # Most invalid_request errors are ordinary bad
+                            # requests and are not limit events at all. Keep
+                            # only the ones that quote a limit as their cause.
+                            if error == "invalid_request" and "limit" not in text.lower():
+                                continue
 
                             events.append({
                                 "timestamp": ts,
@@ -107,30 +176,67 @@ def _find_rate_limit_events(profiles):
                 except Exception:
                     continue
 
-    # Classify limit type from message text
-    import re
+    # Classify limit type from message text.
+    #
+    # Prefer EXPLICIT wording and fall back to the reset delta. Do NOT infer the
+    # type from whether the text carries a date: that heuristic is wrong in both
+    # directions and was silently wrong for months.
+    #   - "hit your weekly limit - resets 9pm"     weekly, no date
+    #   - "hit your limit - resets Apr 7, 4pm"     5-hour hit at 11am, has a date
+    # The wording also CHANGED in June 2026, from "hit your limit" to "hit your
+    # weekly limit", and a plain `"hit your limit" in text` substring test does
+    # not match the new string. That dropped every event after 2026-05 into
+    # "unknown" (1,863 of them) and emptied the budget timeline. The
+    # unknown-rate guard below exists so the next rewording is loud, not silent.
     for e in events:
         text = e.get("text", "")
         text_lower = text.lower()
-        if "5-hour" in text_lower or "5 hour" in text_lower:
+        if ("5-hour" in text_lower or "5 hour" in text_lower
+                # Renamed to "session limit" alongside the "weekly limit"
+                # rename. Same rolling ~5h bucket, new label.
+                or "session limit" in text_lower):
             e["limit_type"] = "5-hour"
         elif "extra usage" in text_lower:
             e["limit_type"] = "extra-usage"
-        elif "hit your limit" in text_lower:
-            # Distinguish 5h from weekly by reset time
-            # "resets Feb 19 at 10am" = weekly (has date); "resets 6pm" = 5-hour
-            if re.search(r"resets\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)", text_lower):
-                e["limit_type"] = "weekly"
-            else:
-                e["limit_type"] = "5-hour"
+        elif "usage credits" in text_lower:
+            # Model-scoped credit balance, exhausted independently of the
+            # rolling limits. Its own class: a pinned model stops dead here
+            # while the account still has ordinary headroom.
+            e["limit_type"] = "credits"
+        elif "weekly limit" in text_lower:
+            e["limit_type"] = "weekly"
         elif "rate limit reached" in text_lower:
             e["limit_type"] = "api-ratelimit"
+        elif "hit your limit" in text_lower:
+            delta = _reset_delta_hours(text, e["timestamp"])
+            if delta is None:
+                e["limit_type"] = "unknown"
+            else:
+                # A 5-hour window can never reset more than 5h out; allow an
+                # hour of slop for the timezone label we do not resolve.
+                e["limit_type"] = "5-hour" if delta <= 6 else "weekly"
         elif e.get("hours_till_reset") and e["hours_till_reset"] > 24:
             e["limit_type"] = "weekly"
         elif e.get("hours_till_reset") and e["hours_till_reset"] <= 5:
             e["limit_type"] = "5-hour"
         else:
             e["limit_type"] = "unknown"
+
+    # Unknowns are the failure mode this whole classifier has, and it is SILENT:
+    # downstream stages filter on limit_type, so a wording change does not raise
+    # anything, it just empties the charts and shrinks the training set. Say so
+    # loudly, and print a sample so the new wording can be read off directly.
+    conv = [e for e in events if e["source"] == "conversation"]
+    unknown = [e for e in conv if e["limit_type"] == "unknown"]
+    if conv and len(unknown) / len(conv) > 0.02:
+        from collections import Counter
+        samples = Counter(e["text"][:100] for e in unknown)
+        print(f"  WARNING: {len(unknown)}/{len(conv)} limit events "
+              f"({100 * len(unknown) / len(conv):.0f}%) could not be classified.")
+        print("  The message wording has probably changed. Most common unmatched text:")
+        for text, n in samples.most_common(3):
+            print(f"    {n:>5}x  {text}")
+        print()
 
     # Deduplicate: keep only the FIRST hit per limit window
     # (users retry after hitting limit, creating duplicate events)
@@ -148,26 +254,44 @@ def _find_rate_limit_events(profiles):
     return deduped
 
 
-def _calculate_window_costs(limit_events, sorted_turns, config):
+def _calculate_window_costs(limit_events, sorted_turns, config, group_of=None):
     """For each rate-limit event, calculate total cost in the preceding 5h window."""
     points = []
+    group_of = group_of or {}
 
     # Only use conversation-source rate_limit events (not "allowed" telemetry)
     actual_limits = [e for e in limit_events
                      if e["source"] == "conversation"
                      or e.get("status") in ("rate_limited", "allowed_warning")]
 
+    # Index turns by budget group ONCE, keeping each list in timestamp order.
+    # A per-event scan of the whole turn list is O(events x turns), which is
+    # ~4e9 comparisons on a real fleet archive and takes longer than the rest
+    # of the report put together.
+    by_group = {}
+    for t in sorted_turns:
+        if t.model == "<synthetic>":
+            continue
+        by_group.setdefault(group_of.get(t.profile_name, t.profile_name), []).append(t)
+    group_times = {g: [t.timestamp for t in ts_] for g, ts_ in by_group.items()}
+
     for event in actual_limits:
         ts = event["timestamp"]
         window_start = ts - timedelta(hours=5)
-        profile = event["profile"]
+        group = event.get("group") or group_of.get(event["profile"], event["profile"])
 
-        # Find all turns in this 5h window for the same profile
-        # (limits are per-account, and concurrent chats all count)
-        window_turns = [t for t in sorted_turns
-                        if window_start <= t.timestamp <= ts
-                        and t.model != "<synthetic>"
-                        and t.profile_name == profile]
+        # Take the turns in this 5h window that drew on the SAME BUDGET. Limits
+        # are per account, so every profile dir logged into that account counts
+        # against the window -- filtering to the one dir that happened to log
+        # the error undercounts the usage that actually caused it, by however
+        # many dirs share the account.
+        turns_in_group = by_group.get(group)
+        if not turns_in_group:
+            continue
+        times = group_times[group]
+        lo = bisect_left(times, window_start)
+        hi = bisect_right(times, ts)
+        window_turns = turns_in_group[lo:hi]
 
         if not window_turns:
             continue
@@ -213,10 +337,38 @@ def run(ctx):
     print(section_header("CALIBRATION DIAGNOSTICS"))
     print("  Investigating the unknown limit model with data science techniques.\n")
 
+    # Usage limits are per ACCOUNT, not per profile directory. Several profile
+    # dirs can share one account (e.g. a fleet of agents all logged in as the
+    # same user), and then a per-dir window sees only that dir's slice of the
+    # usage that actually caused the limit event -- which biases the fitted
+    # threshold down by however many dirs share the account. Group by account
+    # unless explicitly asked for the old per-dir view.
+    group_by = getattr(ctx, "group_by", "account") or "account"
+    if group_by == "account":
+        group_of = {p.name: (p.email or p.name) for p in profiles}
+    else:
+        group_of = {p.name: p.name for p in profiles}
+
+    shared = {}
+    for p in profiles:
+        shared.setdefault(p.email or p.name, []).append(p.name)
+    multi = {k: v for k, v in shared.items() if len(v) > 1}
+    print(f"  Grouping windows by: {group_by}")
+    if multi:
+        for acct, dirs in sorted(multi.items()):
+            print(f"    {acct}: {len(dirs)} profile dirs share this budget "
+                  f"({', '.join(sorted(dirs))})")
+        if group_by != "account":
+            print("    WARNING: grouping by dir splits those shared budgets, so each\n"
+                  "    window undercounts the usage that caused its limit event.")
+    print()
+
     # Get rate limit events and calibration points
     limit_events = _find_rate_limit_events(profiles)
+    for e in limit_events:
+        e["group"] = group_of.get(e["profile"], e["profile"])
     sorted_turns = sorted(turns, key=lambda t: t.timestamp)
-    points = _calculate_window_costs(limit_events, sorted_turns, config)
+    points = _calculate_window_costs(limit_events, sorted_turns, config, group_of)
 
     # Filter to 5-hour hard limits, then dedupe retries (same reset window)
     five_hour_raw = [p for p in points
@@ -225,6 +377,19 @@ def run(ctx):
 
     print(f"  Total calibration points: {len(points)}")
     print(f"  5-hour limit events: {len(five_hour_raw)} raw, {len(five_hour)} unique windows")
+
+    # Show the whole event population, not just the slice the charts use. The
+    # 5-hour filter below is a legitimate narrowing, but when it silently ate
+    # everything after 2026-05 it looked exactly like "no limits were hit".
+    from collections import Counter
+    breakdown = Counter(e["limit_type"] for e in limit_events
+                        if e["source"] == "conversation")
+    if breakdown:
+        print("  All limit events by type: "
+              + ", ".join(f"{n} {t}" for t, n in breakdown.most_common()))
+        latest = max(e["timestamp"] for e in limit_events
+                     if e["source"] == "conversation")
+        print(f"  Most recent limit event: {latest:%Y-%m-%d %H:%M} UTC")
     print()
 
     if len(five_hour) < 5:
@@ -234,7 +399,8 @@ def run(ctx):
     _correlation_analysis(five_hour)
     _feature_scatter_plots(five_hour, output_dir)
     _budget_timeline(five_hour, sorted_turns, config, output_dir)
-    _logistic_regression_analysis(limit_events, sorted_turns, config, output_dir)
+    _logistic_regression_analysis(limit_events, sorted_turns, config, output_dir,
+                                  group_of=group_of)
 
 
 def _correlation_analysis(points):
@@ -343,8 +509,12 @@ def _feature_scatter_plots(points, output_dir):
 def _dedupe_by_reset_window(points):
     """Keep only the first calibration point per unique reset window.
 
-    Groups by profile + date + reset time from message text (e.g. "resets 5pm").
-    This filters out retry events that fire every 10 minutes against the same limit.
+    Groups by ACCOUNT + date + reset time from message text (e.g. "resets 5pm").
+    This filters out retry events that fire every 10 minutes against the same
+    limit, AND the copies of one account-level limit that every profile dir
+    sharing that account logs independently. Keying on the profile dir instead
+    keeps one event per dir: three agents on one account produce three
+    identical rows, each with the same budget, inflating the window count.
     """
     seen = set()
     deduped = []
@@ -352,7 +522,8 @@ def _dedupe_by_reset_window(points):
         text = p["event"].get("text", "")
         match = re.search(r"resets\s+(\S+)", text.lower())
         reset = match.group(1) if match else "x"
-        key = f"{p['event']['profile']}_{p['window_end'].strftime('%Y-%m-%d')}_{reset}"
+        group = p["event"].get("group") or p["event"]["profile"]
+        key = f"{group}_{p['window_end'].strftime('%Y-%m-%d')}_{reset}"
         if key not in seen:
             seen.add(key)
             deduped.append(p)
@@ -454,10 +625,13 @@ def _budget_timeline(points, sorted_turns, config, output_dir):
         print(f"  Could not generate chart: {e}\n")
 
 
-def _logistic_regression_analysis(limit_events, sorted_turns, config, output_dir):
+def _logistic_regression_analysis(limit_events, sorted_turns, config, output_dir,
+                                  group_of=None, limit_types=("5-hour",)):
     """Binary classification: predict whether a 5h window hits the limit."""
     print(subsection_header("Logistic Regression Analysis"))
     print("  Can we predict limit hits from token usage patterns?\n")
+
+    from collections import Counter
 
     from sklearn.linear_model import LogisticRegression
     from sklearn.preprocessing import StandardScaler
@@ -465,41 +639,82 @@ def _logistic_regression_analysis(limit_events, sorted_turns, config, output_dir
 
     import numpy as np
 
-    hard_limits = [e for e in limit_events if e["source"] == "conversation"]
-    limit_times = {e["timestamp"] for e in hard_limits}
+    group_of = group_of or {}
+    conv = [e for e in limit_events if e["source"] == "conversation"]
+
+    # The features are a 5-HOUR window, so only a 5-hour limit is explained by
+    # them. A weekly hit is caused by the preceding WEEK, so labelling its
+    # 5h window as a positive teaches the fit that ordinary usage hits limits.
+    # Keep the classes separate and say what was set aside.
+    hard_limits = [e for e in conv if e["limit_type"] in limit_types]
+    excluded = Counter(e["limit_type"] for e in conv if e["limit_type"] not in limit_types)
+    print(f"  Fitting on limit types: {', '.join(limit_types)}  "
+          f"({len(hard_limits)} of {len(conv)} events)")
+    if excluded:
+        print("  Set aside (not explained by a 5h window): "
+              + ", ".join(f"{n} {t}" for t, n in excluded.most_common()))
+    print()
+
+    # Index turns by group ONCE, and keep a parallel timestamp list so a window
+    # is a bisect rather than a scan. Otherwise every limit event rescans its
+    # whole group, which is where this report spends most of its time.
+    by_group = {}
+    for t in sorted_turns:
+        if t.model == "<synthetic>":
+            continue
+        by_group.setdefault(group_of.get(t.profile_name, t.profile_name), []).append(t)
+    group_times = {g: [t.timestamp for t in ts_] for g, ts_ in by_group.items()}
+
+    def window_slice(g, start, end):
+        turns_in_group = by_group.get(g)
+        if not turns_in_group:
+            return []
+        times = group_times[g]
+        return turns_in_group[bisect_left(times, start):bisect_right(times, end)]
 
     windows = []
 
-    # Build hit windows per-profile (limits are per-account)
-    for e in hard_limits:
+    # A single account-level limit is reported independently by every profile
+    # dir sharing that account, within seconds of each other. That is ONE event,
+    # so collapse them -- otherwise the same window enters the fit once per dir
+    # and the hit class is silently inflated.
+    seen = set()
+    deduped_hits = []
+    for e in sorted(hard_limits, key=lambda x: x["timestamp"]):
+        g = e.get("group", e["profile"])
+        key = (g, int(e["timestamp"].timestamp()) // 300)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped_hits.append(e)
+
+    # Build hit windows per group (limits are per-account)
+    for e in deduped_hits:
         ts = e["timestamp"]
-        profile = e["profile"]
-        window_start = ts - timedelta(hours=5)
-        wt = [t for t in sorted_turns
-              if window_start <= t.timestamp <= ts and t.model != "<synthetic>"
-              and t.profile_name == profile]
+        g = e.get("group", e["profile"])
+        wt = window_slice(g, ts - timedelta(hours=5), ts)
         if wt:
             windows.append(_build_window(wt, config, hit=1))
 
-    # Build non-hit windows per-profile
-    profiles_seen = set(e["profile"] for e in hard_limits)
-    for profile in profiles_seen:
-        profile_turns = [t for t in sorted_turns
-                         if t.profile_name == profile and t.model != "<synthetic>"]
-        if not profile_turns:
+    # Build non-hit windows per group
+    groups_seen = set(e.get("group", e["profile"]) for e in deduped_hits)
+    for g in groups_seen:
+        group_turns = by_group.get(g, [])
+        if not group_turns:
             continue
-        profile_limit_times = {e["timestamp"] for e in hard_limits
-                               if e["profile"] == profile}
-        first_ts = profile_turns[0].timestamp
-        last_ts = profile_turns[-1].timestamp
+        # Sorted, so "is there a limit within an hour of here" is a bisect
+        # rather than a scan over every limit the group ever hit.
+        group_limit_times = sorted(e["timestamp"] for e in hard_limits
+                                   if e.get("group", e["profile"]) == g)
+        first_ts = group_turns[0].timestamp
+        last_ts = group_turns[-1].timestamp
         current = first_ts + timedelta(hours=5)
         while current < last_ts:
-            near_limit = any(abs((current - lt).total_seconds()) < 3600
-                            for lt in profile_limit_times)
+            i = bisect_left(group_limit_times, current - timedelta(hours=1))
+            near_limit = (i < len(group_limit_times)
+                          and group_limit_times[i] <= current + timedelta(hours=1))
             if not near_limit:
-                window_start = current - timedelta(hours=5)
-                wt = [t for t in profile_turns
-                      if window_start <= t.timestamp <= current]
+                wt = window_slice(g, current - timedelta(hours=5), current)
                 if wt:
                     windows.append(_build_window(wt, config, hit=0))
             current += timedelta(hours=5)
