@@ -459,10 +459,12 @@ def _run_window(spec, limit_events, sorted_turns, config, group_of, output_dir):
         return
 
     _correlation_analysis(unique)
-    _feature_scatter_plots(unique, output_dir)
+    _feature_scatter_plots(unique, output_dir, label=label)
     _budget_timeline(unique, sorted_turns, config, output_dir,
                      group_of=group_of, duration=spec["duration"],
-                     stride=spec["stride"], label=label)
+                     stride=spec["stride"], label=label,
+                     all_limit_events=[e for e in limit_events
+                                       if e["source"] == "conversation"])
     _logistic_regression_analysis(limit_events, sorted_turns, config, output_dir,
                                   group_of=group_of,
                                   limit_types=spec["limit_types"],
@@ -504,7 +506,7 @@ def _correlation_analysis(points):
     print()
 
 
-def _feature_scatter_plots(points, output_dir):
+def _feature_scatter_plots(points, output_dir, label="5-hour"):
     """Generate scatter plots of each feature vs budget."""
     print(subsection_header("Feature Scatter Plots"))
 
@@ -564,7 +566,8 @@ def _feature_scatter_plots(points, output_dir):
             ax.set_ylabel("Budget at Limit ($)", fontsize=9)
             ax.grid(True, alpha=0.2)
 
-        plt.suptitle("Feature vs Budget at Rate-Limit Hit", fontsize=14, fontweight="bold")
+        plt.suptitle(f"Feature vs Budget at Rate-Limit Hit ({label} limit)",
+                     fontsize=14, fontweight="bold")
         plt.tight_layout()
         path = output_dir / "calibration_scatter.png"
         plt.savefig(path, dpi=150, bbox_inches="tight", facecolor="white")
@@ -624,7 +627,7 @@ def _dedupe_by_reset_window(points):
 
 def _budget_timeline(points, sorted_turns, config, output_dir, group_of=None,
                      duration=timedelta(hours=5), stride=timedelta(hours=5),
-                     label="5-hour"):
+                     label="5-hour", all_limit_events=None):
     """Plot cost-at-limit over time, with non-hit windows as baseline."""
     group_of = group_of or {}
     print(subsection_header("Budget Timeline"))
@@ -668,9 +671,17 @@ def _budget_timeline(points, sorted_turns, config, output_dir, group_of=None,
         non_hit_times = []
         non_hit_costs = []
         for g, group_turns in by_group.items():
-            limit_times = sorted(p["window_end"] for p in points
-                                 if (p["event"].get("group")
-                                     or p["event"]["profile"]) == g)
+            # Screen against EVERY limit event, matching how the regression
+            # builds its controls. Screening only against the plotted type
+            # leaves windows where extra usage was bought and exhausted sitting
+            # in the baseline as ordinary non-hit windows, at costs far above
+            # anything the plotted limit ever allowed.
+            limit_times = sorted(e["timestamp"] for e in (all_limit_events or [])
+                                 if (e.get("group") or e["profile"]) == g)
+            if not limit_times:
+                limit_times = sorted(p["window_end"] for p in points
+                                     if (p["event"].get("group")
+                                         or p["event"]["profile"]) == g)
             times = group_times[g]
             current = group_turns[0].timestamp + duration
             last_ts = group_turns[-1].timestamp
@@ -709,7 +720,10 @@ def _budget_timeline(points, sorted_turns, config, output_dir, group_of=None,
 
         ax.set_xlabel("Date", fontsize=12)
         ax.set_ylabel("Cost at Limit Hit ($)", fontsize=12)
-        ax.set_title("Budget at Each Rate-Limit Hit Over Time", fontsize=14, fontweight="bold")
+        # Name the bucket in the title: both windows produce this chart, and
+        # side by side they are otherwise indistinguishable.
+        ax.set_title(f"Budget at Each Rate-Limit Hit Over Time ({label} limit)",
+                     fontsize=14, fontweight="bold")
         ax.legend(fontsize=9, loc="best")
         ax.grid(True, alpha=0.2)
         ax.tick_params(axis="x", rotation=30)
@@ -800,9 +814,12 @@ def _logistic_regression_analysis(limit_events, sorted_turns, config, output_dir
         group_turns = by_group.get(g, [])
         if not group_turns:
             continue
-        # Sorted, so "is there a limit within an hour of here" is a bisect
-        # rather than a scan over every limit the group ever hit.
-        group_limit_times = sorted(e["timestamp"] for e in hard_limits
+        # Controls are screened against EVERY limit event, not just the fitted
+        # type. A window in which extra usage was bought and then exhausted is
+        # not a clean negative: it exceeded the ordinary allowance and simply
+        # did not report THIS limit, so counting it as "no hit" teaches the fit
+        # that such weeks are fine. Sorted, so the containment test is a bisect.
+        group_limit_times = sorted(e["timestamp"] for e in conv
                                    if e.get("group", e["profile"]) == g)
         first_ts = group_turns[0].timestamp
         last_ts = group_turns[-1].timestamp
@@ -862,7 +879,10 @@ def _logistic_regression_analysis(limit_events, sorted_turns, config, output_dir
     for name in sorted(results, key=lambda n: -results[n]["auc"]):
         r = results[name]
         coef_str = ", ".join(f"{f}={c:+.3f}" for f, c in zip(r["features"], r["coefs"]))
-        rows.append([name, f"{r['auc']:.4f}", coef_str[:60]])
+        # Do NOT truncate: the table auto-sizes, and a 60-char cap cut the
+        # cache_read coefficient off exactly the rows that fit all four
+        # features, which are the rows the coefficient comparison is about.
+        rows.append([name, f"{r['auc']:.4f}", coef_str])
     print(table(["Model", "AUC", "Coefficients (standardized)"], rows, "lrl"))
 
     best_name = max(results, key=lambda n: results[n]["auc"])
@@ -913,7 +933,8 @@ def _logistic_regression_analysis(limit_events, sorted_turns, config, output_dir
         ax2.set_title("Feature Importance (All 4 Token Types)", fontsize=13)
         ax2.grid(True, alpha=0.2, axis="x")
 
-        plt.suptitle("Logistic Regression: What Predicts Limit Hits?",
+        # .capitalize() leaves "5-hour" alone (leading digit) and gives "Weekly".
+        plt.suptitle(f"Logistic Regression: What Predicts {label.capitalize()} Limit Hits?",
                       fontsize=14, fontweight="bold")
         plt.tight_layout()
         path = output_dir / "logistic_regression.png"
