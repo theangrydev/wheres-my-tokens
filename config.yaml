@@ -8,6 +8,43 @@
 # For 1-hour TTL cache writes, the rate is 2x input price.
 
 pricing:
+  # --- Current models ---
+  # NOTE: cache_creation below uses the 1-HOUR TTL rate (2x input), not the
+  # 5-minute rate used by the older entries further down. Long-running agent
+  # sessions use the 1h cache TTL, so the 1h rate is the accurate one for them.
+  # Mixing the two is deliberate: each entry uses the rate its sessions
+  # actually pay. Change these to the 5m rates if your sessions are short.
+  #
+  # Fable 5.1 is the odd one out: its cache READS are 0.025x base input
+  # ($0.25/MTok) rather than the standard 0.1x. That makes its cache reads
+  # HALF the price of Opus 5's despite its input being twice as expensive.
+  # Fable 5 does NOT share this and sits at the standard 0.1x ($1/MTok).
+  claude-fable-5-1:
+    input: 10.0
+    output: 50.0
+    cache_creation: 20.0    # 2x input (1h TTL)
+    cache_read: 0.25        # 0.025x input
+  claude-fable-5:
+    input: 10.0
+    output: 50.0
+    cache_creation: 20.0
+    cache_read: 1.00        # 0.1x input
+  claude-opus-5:
+    input: 5.0
+    output: 25.0
+    cache_creation: 10.0    # 2x input (1h TTL)
+    cache_read: 0.50
+  claude-opus-4-8:
+    input: 5.0
+    output: 25.0
+    cache_creation: 10.0
+    cache_read: 0.50
+  claude-sonnet-5:
+    input: 2.0
+    output: 10.0
+    cache_creation: 4.0
+    cache_read: 0.20
+
   # Opus 4.6 / 4.5 — $5 input, $25 output
   claude-opus-4-6:
     input: 5.0
