@@ -20,6 +20,42 @@ from ..formatting import (
 )
 
 
+# The two limits are separate buckets with separate causes, so each gets its
+# own window and its own fit. Mixing them is not a rounding error: the 5 hours
+# before a WEEKLY hit are usually unremarkable, so labelling them a positive
+# teaches the fit that ordinary usage hits limits.
+#
+# stride is how far apart the non-hit (control) windows are sampled. For the
+# 5-hour bucket a stride equal to the window gives independent, non-overlapping
+# controls and thousands of them. A week-long window stepped by a week yields
+# only ~45 controls per account over a year, which is too few to fit, so the
+# weekly bucket samples daily. Those controls OVERLAP and are therefore not
+# independent -- read the weekly AUC as a ranking, not as a calibrated
+# probability, and do not compare its confidence to the 5-hour model's.
+WINDOW_SPECS = {
+    "5h": {
+        "key": "5h",
+        "label": "5-hour",
+        "duration": timedelta(hours=5),
+        "stride": timedelta(hours=5),
+        "limit_types": ("5-hour",),
+        "overlapping_controls": False,
+    },
+    "1w": {
+        "key": "1w",
+        "label": "weekly",
+        "duration": timedelta(days=7),
+        "stride": timedelta(days=1),
+        "limit_types": ("weekly",),
+        "overlapping_controls": True,
+    },
+}
+
+# Promotional / one-off balances, not a recurring constraint: extra usage bought
+# or granted on top of the plan. Classified so they cannot land in "unknown" and
+# trip the wording guard, but never fitted.
+PROMO_LIMIT_TYPES = ("extra-usage", "credits")
+
 _MONTHS = {m: i for i, m in enumerate(
     ["jan", "feb", "mar", "apr", "may", "jun",
      "jul", "aug", "sep", "oct", "nov", "dec"], start=1)}
@@ -254,8 +290,9 @@ def _find_rate_limit_events(profiles):
     return deduped
 
 
-def _calculate_window_costs(limit_events, sorted_turns, config, group_of=None):
-    """For each rate-limit event, calculate total cost in the preceding 5h window."""
+def _calculate_window_costs(limit_events, sorted_turns, config, group_of=None,
+                            duration=timedelta(hours=5)):
+    """For each rate-limit event, total the cost in the window preceding it."""
     points = []
     group_of = group_of or {}
 
@@ -277,7 +314,7 @@ def _calculate_window_costs(limit_events, sorted_turns, config, group_of=None):
 
     for event in actual_limits:
         ts = event["timestamp"]
-        window_start = ts - timedelta(hours=5)
+        window_start = ts - duration
         group = event.get("group") or group_of.get(event["profile"], event["profile"])
 
         # Take the turns in this 5h window that drew on the SAME BUDGET. Limits
@@ -363,44 +400,75 @@ def run(ctx):
                   "    window undercounts the usage that caused its limit event.")
     print()
 
-    # Get rate limit events and calibration points
+    # Get rate limit events once -- they are shared by every window pass.
     limit_events = _find_rate_limit_events(profiles)
     for e in limit_events:
         e["group"] = group_of.get(e["profile"], e["profile"])
     sorted_turns = sorted(turns, key=lambda t: t.timestamp)
-    points = _calculate_window_costs(limit_events, sorted_turns, config, group_of)
 
-    # Filter to 5-hour hard limits, then dedupe retries (same reset window)
-    five_hour_raw = [p for p in points
-                     if p["is_hard_limit"] and p["event"].get("limit_type") == "5-hour"]
-    five_hour = _dedupe_by_reset_window(five_hour_raw)
-
-    print(f"  Total calibration points: {len(points)}")
-    print(f"  5-hour limit events: {len(five_hour_raw)} raw, {len(five_hour)} unique windows")
-
-    # Show the whole event population, not just the slice the charts use. The
-    # 5-hour filter below is a legitimate narrowing, but when it silently ate
-    # everything after 2026-05 it looked exactly like "no limits were hit".
+    # Show the whole event population BEFORE any window narrows it. Each pass
+    # legitimately keeps one type, but when that filter silently ate everything
+    # after 2026-05 it looked exactly like "no limits were hit".
     from collections import Counter
-    breakdown = Counter(e["limit_type"] for e in limit_events
-                        if e["source"] == "conversation")
+    conv = [e for e in limit_events if e["source"] == "conversation"]
+    breakdown = Counter(e["limit_type"] for e in conv)
     if breakdown:
         print("  All limit events by type: "
               + ", ".join(f"{n} {t}" for t, n in breakdown.most_common()))
-        latest = max(e["timestamp"] for e in limit_events
-                     if e["source"] == "conversation")
-        print(f"  Most recent limit event: {latest:%Y-%m-%d %H:%M} UTC")
+        print(f"  Most recent limit event: "
+              f"{max(e['timestamp'] for e in conv):%Y-%m-%d %H:%M} UTC")
+        promo = sum(n for t, n in breakdown.items() if t in PROMO_LIMIT_TYPES)
+        if promo:
+            print(f"  Excluded as promotional/one-off balances: {promo} "
+                  f"({', '.join(PROMO_LIMIT_TYPES)})")
     print()
 
-    if len(five_hour) < 5:
-        print("  Not enough 5-hour limit events for diagnostics.\n")
+    requested = getattr(ctx, "window", "both") or "both"
+    keys = list(WINDOW_SPECS) if requested == "both" else [requested]
+
+    for key in keys:
+        spec = WINDOW_SPECS[key]
+        # Each window writes to its own subdirectory so the two passes' charts
+        # do not overwrite each other.
+        win_dir = output_dir / key
+        win_dir.mkdir(parents=True, exist_ok=True)
+        _run_window(spec, limit_events, sorted_turns, config, group_of, win_dir)
+
+
+def _run_window(spec, limit_events, sorted_turns, config, group_of, output_dir):
+    """One full calibration pass for a single limit bucket."""
+    label = spec["label"]
+    print(section_header(f"{label.upper()} LIMIT"))
+    print(f"  Window: {spec['duration']}, control windows sampled every {spec['stride']}.")
+    if spec["overlapping_controls"]:
+        print("  NOTE: controls overlap at this stride, so they are not independent")
+        print("  samples. Read the AUC as a ranking, not a calibrated probability.")
+    print(f"  Charts: {output_dir}\n")
+
+    points = _calculate_window_costs(limit_events, sorted_turns, config, group_of,
+                                     duration=spec["duration"])
+    raw = [p for p in points
+           if p["is_hard_limit"] and p["event"].get("limit_type") in spec["limit_types"]]
+    unique = _dedupe_by_reset_window(raw)
+
+    print(f"  Total calibration points: {len(points)}")
+    print(f"  {label} limit events: {len(raw)} raw, {len(unique)} unique windows\n")
+
+    if len(unique) < 5:
+        print(f"  Not enough {label} limit events for diagnostics.\n")
         return
 
-    _correlation_analysis(five_hour)
-    _feature_scatter_plots(five_hour, output_dir)
-    _budget_timeline(five_hour, sorted_turns, config, output_dir)
+    _correlation_analysis(unique)
+    _feature_scatter_plots(unique, output_dir)
+    _budget_timeline(unique, sorted_turns, config, output_dir,
+                     group_of=group_of, duration=spec["duration"],
+                     stride=spec["stride"], label=label)
     _logistic_regression_analysis(limit_events, sorted_turns, config, output_dir,
-                                  group_of=group_of)
+                                  group_of=group_of,
+                                  limit_types=spec["limit_types"],
+                                  duration=spec["duration"],
+                                  stride=spec["stride"],
+                                  label=label)
 
 
 def _correlation_analysis(points):
@@ -506,32 +574,59 @@ def _feature_scatter_plots(points, output_dir):
         print(f"  Could not generate scatter plots: {e}\n")
 
 
-def _dedupe_by_reset_window(points):
-    """Keep only the first calibration point per unique reset window.
+def _limit_window_key(event, group_of=None):
+    """Identity of the limit WINDOW an event belongs to.
 
-    Groups by ACCOUNT + date + reset time from message text (e.g. "resets 5pm").
-    This filters out retry events that fire every 10 minutes against the same
-    limit, AND the copies of one account-level limit that every profile dir
-    sharing that account logs independently. Keying on the profile dir instead
-    keeps one event per dir: three agents on one account produce three
-    identical rows, each with the same budget, inflating the window count.
+    Retries fire every few minutes for as long as the limit holds, and every one
+    of them quotes the SAME reset time, so the quoted reset is the window's
+    identity. A fixed time bucket is not: it splits one limit into a positive
+    per retry, which duplicates near-identical rows into the fit. That matters
+    far more for the weekly bucket, where a limit is retried for DAYS.
+
+    The account is part of the key because every profile directory sharing an
+    account logs the same limit independently.
+
+    A BARE reset time ("resets 4pm") repeats daily, so the date disambiguates
+    it. A DATED reset ("resets Aug 3 at 9pm") is already unique, and including
+    the date would split one week-long limit into one window per day of retries.
+    """
+    group = event.get("group") or (group_of or {}).get(event["profile"], event["profile"])
+    text = (event.get("text") or "").lower()
+    m = re.search(r"resets\s+(.+?)\s*(?:\(|$)", text)
+    if not m:
+        # No reset quoted: fall back to a coarse bucket so retries still merge.
+        return (group, "nots", int(event["timestamp"].timestamp()) // 3600)
+    reset = m.group(1).strip()
+    dated = re.search(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)", reset)
+    if dated:
+        return (group, "dated", reset)
+    return (group, event["timestamp"].strftime("%Y-%m-%d"), reset)
+
+
+def _dedupe_by_reset_window(points):
+    """Keep only the first calibration point per unique limit window.
+
+    See _limit_window_key for what "unique" means. Both this and the regression's
+    hit-window construction use that one helper deliberately: they drifted apart
+    once already (this keyed on the profile directory, so one account-level
+    limit produced an identical row per agent), and a shared key is the only
+    thing that stops it happening again.
     """
     seen = set()
     deduped = []
     for p in sorted(points, key=lambda x: x["window_end"]):
-        text = p["event"].get("text", "")
-        match = re.search(r"resets\s+(\S+)", text.lower())
-        reset = match.group(1) if match else "x"
-        group = p["event"].get("group") or p["event"]["profile"]
-        key = f"{group}_{p['window_end'].strftime('%Y-%m-%d')}_{reset}"
+        key = _limit_window_key(p["event"])
         if key not in seen:
             seen.add(key)
             deduped.append(p)
     return deduped
 
 
-def _budget_timeline(points, sorted_turns, config, output_dir):
+def _budget_timeline(points, sorted_turns, config, output_dir, group_of=None,
+                     duration=timedelta(hours=5), stride=timedelta(hours=5),
+                     label="5-hour"):
     """Plot cost-at-limit over time, with non-hit windows as baseline."""
+    group_of = group_of or {}
     print(subsection_header("Budget Timeline"))
     print("  How has the budget at each limit hit changed over time?\n")
 
@@ -559,42 +654,45 @@ def _budget_timeline(points, sorted_turns, config, output_dir):
 
         fig, ax = plt.subplots(figsize=(14, 6))
 
-        profiles_in_data = sorted(set(p["event"]["profile"] for p in points))
+        # Baseline of non-hit windows, grouped by ACCOUNT and sliced by bisect,
+        # matching how the regression builds its controls. Doing it per profile
+        # directory here would draw a different baseline from the one the model
+        # is fitted on, for the same chart.
+        by_group = {}
+        for t in sorted_turns:
+            if t.model == "<synthetic>":
+                continue
+            by_group.setdefault(group_of.get(t.profile_name, t.profile_name), []).append(t)
+        group_times = {g: [t.timestamp for t in ts_] for g, ts_ in by_group.items()}
 
-        # Sample non-hit 5h windows as baseline (per-profile internally)
         non_hit_times = []
         non_hit_costs = []
-        for profile in profiles_in_data:
-            profile_turns = [t for t in sorted_turns
-                             if t.profile_name == profile and t.model != "<synthetic>"]
-            if not profile_turns:
-                continue
-            profile_limit_times = {p["window_end"] for p in points
-                                   if p["event"]["profile"] == profile}
-            first_ts = profile_turns[0].timestamp
-            last_ts = profile_turns[-1].timestamp
-            current = first_ts + timedelta(hours=5)
+        for g, group_turns in by_group.items():
+            limit_times = sorted(p["window_end"] for p in points
+                                 if (p["event"].get("group")
+                                     or p["event"]["profile"]) == g)
+            times = group_times[g]
+            current = group_turns[0].timestamp + duration
+            last_ts = group_turns[-1].timestamp
             while current < last_ts:
-                near_limit = any(abs((current - lt).total_seconds()) < 3600
-                                 for lt in profile_limit_times)
-                if not near_limit:
-                    window_start = current - timedelta(hours=5)
-                    wt = [t for t in profile_turns
-                          if window_start <= t.timestamp <= current]
+                start = current - duration
+                i = bisect_left(limit_times, start)
+                if not (i < len(limit_times) and limit_times[i] <= current):
+                    wt = group_turns[bisect_left(times, start):bisect_right(times, current)]
                     if wt:
-                        cost = sum(
-                            estimate_cost(config, t.model, t.input_tokens, t.output_tokens,
-                                          t.cache_creation_input_tokens, t.cache_read_input_tokens)
-                            for t in wt
-                        )
                         non_hit_times.append(current)
-                        non_hit_costs.append(cost)
-                current += timedelta(hours=5)
+                        non_hit_costs.append(sum(
+                            estimate_cost(config, t.model, t.input_tokens, t.output_tokens,
+                                          t.cache_creation_input_tokens,
+                                          t.cache_read_input_tokens)
+                            for t in wt
+                        ))
+                current += stride
 
         # Plot non-hit windows as light background scatter
         if non_hit_times:
             ax.scatter(non_hit_times, non_hit_costs, color="#bdc3c7", s=12, alpha=0.3,
-                       label=f"Non-hit 5h windows ({len(non_hit_times)})", zorder=1)
+                       label=f"Non-hit {label} windows ({len(non_hit_times)})", zorder=1)
 
         # Plot limit-hit points
         hit_times = [p["window_end"] for p in points]
@@ -626,8 +724,10 @@ def _budget_timeline(points, sorted_turns, config, output_dir):
 
 
 def _logistic_regression_analysis(limit_events, sorted_turns, config, output_dir,
-                                  group_of=None, limit_types=("5-hour",)):
-    """Binary classification: predict whether a 5h window hits the limit."""
+                                  group_of=None, limit_types=("5-hour",),
+                                  duration=timedelta(hours=5),
+                                  stride=timedelta(hours=5), label="5-hour"):
+    """Binary classification: predict whether a window hits the limit."""
     print(subsection_header("Logistic Regression Analysis"))
     print("  Can we predict limit hits from token usage patterns?\n")
 
@@ -642,16 +742,14 @@ def _logistic_regression_analysis(limit_events, sorted_turns, config, output_dir
     group_of = group_of or {}
     conv = [e for e in limit_events if e["source"] == "conversation"]
 
-    # The features are a 5-HOUR window, so only a 5-hour limit is explained by
-    # them. A weekly hit is caused by the preceding WEEK, so labelling its
-    # 5h window as a positive teaches the fit that ordinary usage hits limits.
-    # Keep the classes separate and say what was set aside.
+    # The features describe THIS window, so only a limit on this bucket is
+    # explained by them. Keep the buckets separate and say what was set aside.
     hard_limits = [e for e in conv if e["limit_type"] in limit_types]
     excluded = Counter(e["limit_type"] for e in conv if e["limit_type"] not in limit_types)
     print(f"  Fitting on limit types: {', '.join(limit_types)}  "
           f"({len(hard_limits)} of {len(conv)} events)")
     if excluded:
-        print("  Set aside (not explained by a 5h window): "
+        print(f"  Set aside (not explained by a {label} window): "
               + ", ".join(f"{n} {t}" for t, n in excluded.most_common()))
     print()
 
@@ -674,25 +772,25 @@ def _logistic_regression_analysis(limit_events, sorted_turns, config, output_dir
 
     windows = []
 
-    # A single account-level limit is reported independently by every profile
-    # dir sharing that account, within seconds of each other. That is ONE event,
-    # so collapse them -- otherwise the same window enters the fit once per dir
-    # and the hit class is silently inflated.
+    # Collapse retries and per-directory copies into one event per limit window.
+    # Without this the same limit enters the fit once per retry and once per
+    # profile dir, duplicating near-identical rows and inflating the hit class.
     seen = set()
     deduped_hits = []
     for e in sorted(hard_limits, key=lambda x: x["timestamp"]):
-        g = e.get("group", e["profile"])
-        key = (g, int(e["timestamp"].timestamp()) // 300)
+        key = _limit_window_key(e, group_of)
         if key in seen:
             continue
         seen.add(key)
         deduped_hits.append(e)
+    print(f"  Hit windows: {len(hard_limits)} events -> {len(deduped_hits)} "
+          f"distinct limit windows (retries and per-directory copies collapsed)")
 
     # Build hit windows per group (limits are per-account)
     for e in deduped_hits:
         ts = e["timestamp"]
         g = e.get("group", e["profile"])
-        wt = window_slice(g, ts - timedelta(hours=5), ts)
+        wt = window_slice(g, ts - duration, ts)
         if wt:
             windows.append(_build_window(wt, config, hit=1))
 
@@ -708,16 +806,22 @@ def _logistic_regression_analysis(limit_events, sorted_turns, config, output_dir
                                    if e.get("group", e["profile"]) == g)
         first_ts = group_turns[0].timestamp
         last_ts = group_turns[-1].timestamp
-        current = first_ts + timedelta(hours=5)
+        current = first_ts + duration
         while current < last_ts:
-            i = bisect_left(group_limit_times, current - timedelta(hours=1))
-            near_limit = (i < len(group_limit_times)
-                          and group_limit_times[i] <= current + timedelta(hours=1))
-            if not near_limit:
-                wt = window_slice(g, current - timedelta(hours=5), current)
+            # A control must not CONTAIN a limit event. A window that does is
+            # not a negative: the usage inside it is exactly what tripped the
+            # limit, so labelling it "no hit" teaches the fit the opposite of
+            # the truth. Scaling with the window matters -- a fixed +/-1h zone
+            # rejects almost nothing from a 7-day window.
+            start = current - duration
+            i = bisect_left(group_limit_times, start)
+            contains_limit = (i < len(group_limit_times)
+                              and group_limit_times[i] <= current)
+            if not contains_limit:
+                wt = window_slice(g, start, current)
                 if wt:
                     windows.append(_build_window(wt, config, hit=0))
-            current += timedelta(hours=5)
+            current += stride
 
     hit_count = sum(1 for w in windows if w["hit"])
     nohit_count = len(windows) - hit_count

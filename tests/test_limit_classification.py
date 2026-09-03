@@ -17,7 +17,9 @@ Run with:  python3 -m unittest discover tests
 import unittest
 from datetime import datetime, timezone
 
-from wheres_my_tokens.reports.analyze import _reset_delta_hours, _find_rate_limit_events
+from wheres_my_tokens.reports.analyze import (
+    _find_rate_limit_events, _limit_window_key, _reset_delta_hours,
+)
 
 
 def at(iso):
@@ -63,6 +65,65 @@ class ResetDeltaTest(unittest.TestCase):
     def test_empty_and_none(self):
         self.assertIsNone(_reset_delta_hours("", at("2026-04-07T11:02:00")))
         self.assertIsNone(_reset_delta_hours(None, at("2026-04-07T11:02:00")))
+
+
+class WindowKeyTest(unittest.TestCase):
+    """One limit = one key, however many retries and directories logged it."""
+
+    def ev(self, text, ts, group="acct", profile="p"):
+        return {"text": text, "timestamp": at(ts), "group": group, "profile": profile}
+
+    def test_retries_against_one_limit_collapse(self):
+        # Retries fire every few minutes and all quote the same reset.
+        a = self.ev("You've hit your session limit · resets 4pm", "2026-08-15T11:02:00")
+        b = self.ev("You've hit your session limit · resets 4pm", "2026-08-15T11:47:00")
+        self.assertEqual(_limit_window_key(a), _limit_window_key(b))
+
+    def test_same_limit_from_different_directories_collapses(self):
+        # Three agents on one account each log the same account-level limit.
+        a = self.ev("You've hit your weekly limit · resets Aug 20 at 9pm",
+                    "2026-08-15T11:02:00", profile="agent-1")
+        b = self.ev("You've hit your weekly limit · resets Aug 20 at 9pm",
+                    "2026-08-15T11:05:00", profile="agent-3")
+        self.assertEqual(_limit_window_key(a), _limit_window_key(b))
+
+    def test_weekly_retries_days_apart_still_collapse(self):
+        # The whole reason the key is not a time bucket: a weekly limit is
+        # retried for DAYS, and every retry quotes the same dated reset.
+        a = self.ev("You've hit your weekly limit · resets Aug 20 at 9pm",
+                    "2026-08-15T11:02:00")
+        b = self.ev("You've hit your weekly limit · resets Aug 20 at 9pm",
+                    "2026-08-18T22:30:00")
+        self.assertEqual(_limit_window_key(a), _limit_window_key(b))
+
+    def test_bare_time_on_different_days_does_not_collapse(self):
+        # "resets 4pm" recurs daily, so these are two distinct limits.
+        a = self.ev("You've hit your session limit · resets 4pm", "2026-08-15T11:02:00")
+        b = self.ev("You've hit your session limit · resets 4pm", "2026-08-16T11:02:00")
+        self.assertNotEqual(_limit_window_key(a), _limit_window_key(b))
+
+    def test_different_accounts_do_not_collapse(self):
+        a = self.ev("resets 4pm", "2026-08-15T11:02:00", group="acct-a")
+        b = self.ev("resets 4pm", "2026-08-15T11:02:00", group="acct-b")
+        self.assertNotEqual(_limit_window_key(a), _limit_window_key(b))
+
+    def test_timezone_label_is_not_part_of_the_key(self):
+        # Same limit, one message rendered in each timezone label.
+        a = self.ev("resets 9pm (UTC)", "2026-08-15T11:02:00")
+        b = self.ev("resets 9pm (Europe/London)", "2026-08-15T11:20:00")
+        self.assertEqual(_limit_window_key(a), _limit_window_key(b))
+
+    def test_no_reset_time_falls_back_to_a_bucket(self):
+        a = self.ev("something went wrong", "2026-08-15T11:02:00")
+        b = self.ev("something went wrong", "2026-08-15T11:47:00")
+        c = self.ev("something went wrong", "2026-08-15T18:02:00")
+        self.assertEqual(_limit_window_key(a), _limit_window_key(b))
+        self.assertNotEqual(_limit_window_key(a), _limit_window_key(c))
+
+    def test_group_resolved_from_map_when_event_lacks_one(self):
+        e = {"text": "resets 4pm", "timestamp": at("2026-08-15T11:02:00"),
+             "profile": "agent-1"}
+        self.assertEqual(_limit_window_key(e, {"agent-1": "acct"})[0], "acct")
 
 
 class FakeProfile:

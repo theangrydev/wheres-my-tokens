@@ -113,7 +113,20 @@ def main(argv=None):
     subs.add_parser("visualize", help="Generate shareable charts")
 
     # Advanced
-    subs.add_parser("analyze", help="Reverse-engineer limit formula: regression, scatter plots, budget timeline")
+    analyze_p = subs.add_parser(
+        "analyze",
+        help="Reverse-engineer limit formula: regression, scatter plots, budget timeline")
+    analyze_p.add_argument(
+        "--window", choices=["5h", "1w", "both"], default="both",
+        help="Which limit bucket to calibrate against: the 5h session limit, "
+             "the 1w weekly limit, or both (default). They are separate buckets "
+             "with separate causes, so each gets its own fit and writes charts "
+             "to its own output/<window>/ subdirectory.")
+    analyze_p.add_argument(
+        "--group-by", choices=["account", "dir"], dest="group_by", default="account",
+        help="Aggregate windows per account (default) or per profile directory. "
+             "Limits are per account, so 'dir' splits a shared budget and "
+             "undercounts the usage behind each limit event.")
 
     subs.add_parser("all", help="Run all text reports")
     subs.add_parser("clean", help="Delete generated output and caches")
@@ -190,7 +203,9 @@ def main(argv=None):
 
     # Dispatch
     ctx = ReportContext(turns=turns, sessions=sessions, config=config,
-                        profiles=profiles, top_n=top_n, output_dir=output_dir)
+                        profiles=profiles, top_n=top_n, output_dir=output_dir,
+                        window=getattr(args, "window", "both"),
+                        group_by=getattr(args, "group_by", "account"))
 
     text_reports = ["limits", "summary", "daily"]
 
@@ -205,13 +220,16 @@ def main(argv=None):
 
 class ReportContext:
     """Shared context passed to all report modules."""
-    def __init__(self, turns, sessions, config, profiles, top_n, output_dir):
+    def __init__(self, turns, sessions, config, profiles, top_n, output_dir,
+                 window="both", group_by="account"):
         self.turns = turns
         self.sessions = sessions
         self.config = config
         self.profiles = profiles
         self.top_n = top_n
         self.output_dir = output_dir
+        self.window = window
+        self.group_by = group_by
 
 
 def _run_report(name: str, ctx: ReportContext):
